@@ -37,7 +37,14 @@ with st.sidebar:
 
 st.subheader('1 · Echte Artikel erfassen')
 st.caption('Pro Zeile einen konkreten Artikel und dessen Originalbild-URL eintragen. Keine KI-erfundenen Produkte oder Bilder.')
-df = st.data_editor(st.session_state.items, num_rows='dynamic', use_container_width=True, hide_index=True, key='editor', column_config={
+# Explicit column types prevent Arrow/Streamlit conversion failures on cloud deployments.
+source = st.session_state.items.copy()
+text_columns = ['Produkt', 'Händler', 'Produktlink', 'Originalbild-URL', 'Verfügbarkeit für Gesamtmenge']
+for column in text_columns:
+    source[column] = source[column].fillna('').astype(str)
+source['Stückpreis CHF'] = pd.to_numeric(source['Stückpreis CHF'], errors='coerce').fillna(0.0).astype(float)
+source['Anzahl je Box'] = pd.to_numeric(source['Anzahl je Box'], errors='coerce').fillna(0).astype(int)
+df = st.data_editor(source, num_rows='dynamic', use_container_width=True, hide_index=True, key='editor', column_config={
     'Produktlink':st.column_config.LinkColumn('Produktlink'),
     'Originalbild-URL':st.column_config.LinkColumn('Originalbild-URL'),
     'Stückpreis CHF':st.column_config.NumberColumn('Stückpreis CHF',min_value=0,format='%.2f'),
