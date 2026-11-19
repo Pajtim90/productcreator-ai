@@ -38,7 +38,7 @@ with st.sidebar:
 st.subheader('1 · Echte Artikel erfassen')
 st.caption('Pro Zeile einen konkreten Artikel und dessen Originalbild-URL eintragen. Keine KI-erfundenen Produkte oder Bilder.')
 # Explicit column types prevent Arrow/Streamlit conversion failures on cloud deployments.
-source = st.session_state.items.copy()
+source = st.session_state["items"].copy()
 text_columns = ['Produkt', 'Händler', 'Produktlink', 'Originalbild-URL', 'Verfügbarkeit für Gesamtmenge']
 for column in text_columns:
     source[column] = source[column].fillna('').astype(str)
