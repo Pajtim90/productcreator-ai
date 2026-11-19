@@ -1,93 +1,159 @@
-import io
-import json
+import os
+import re
 from datetime import datetime, timezone
-from decimal import Decimal
 from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 import streamlit as st
-from PIL import Image, ImageDraw, ImageFont
 
 st.set_page_config(page_title='ProductCreator AI', page_icon='🎁', layout='wide')
 st.title('🎁 ProductCreator AI')
-st.caption('Produktgetreuer Geschenkbox-Konfigurator · MVP 0.3 · CHF')
-st.info('Diese Version recherchiert noch nicht autonom. Erfasse reale Produktangebote mit Händlerlink und Originalbild-URL. Preise, Verfügbarkeit und Bildrechte müssen vor dem Verkauf geprüft werden.')
-
-DEFAULT = [
-    {'Produkt':'Notizbuch A5, schwarz','Händler':'','Produktlink':'','Originalbild-URL':'','Stückpreis CHF':6.70,'Anzahl je Box':1,'Verfügbarkeit für Gesamtmenge':'Ungeprüft'},
-    {'Produkt':'Trinkflasche','Händler':'','Produktlink':'','Originalbild-URL':'','Stückpreis CHF':2.95,'Anzahl je Box':1,'Verfügbarkeit für Gesamtmenge':'Ungeprüft'},
-    {'Produkt':'Schokolade 100 g','Händler':'','Produktlink':'','Originalbild-URL':'','Stückpreis CHF':3.95,'Anzahl je Box':1,'Verfügbarkeit für Gesamtmenge':'Ungeprüft'},
-    {'Produkt':'Geschenkverpackung','Händler':'','Produktlink':'','Originalbild-URL':'','Stückpreis CHF':6.80,'Anzahl je Box':1,'Verfügbarkeit für Gesamtmenge':'Ungeprüft'},
-    {'Produkt':'Füllmaterial und Karte (Schätzung)','Händler':'','Produktlink':'','Originalbild-URL':'','Stückpreis CHF':1.30,'Anzahl je Box':1,'Verfügbarkeit für Gesamtmenge':'Ungeprüft'},
-]
-if 'items' not in st.session_state:
-    st.session_state.items = pd.DataFrame(DEFAULT)
+st.caption('MVP 0.4 · Live-Produktsuche · Schweiz · CHF')
+st.info('Suchresultate sind Produktkandidaten, keine bestätigten Einkaufsangebote. Prüfe Preis, Variante, Versand, Lieferbarkeit und Bildrechte beim Händler.')
 
 with st.sidebar:
     st.header('Auftrag')
     idea = st.text_area('Produktidee', 'Hochwertige Onboarding-Geschenkbox für neue Mitarbeitende')
-    budget = st.number_input('Max. Materialkosten je Box (CHF)', min_value=0.01, value=30.0, step=1.0)
-    qty = st.number_input('Anzahl Boxen', min_value=1, value=10, step=1)
-    margin = st.number_input('Ziel-Deckungsbeitragsmarge (%)', min_value=0.0, max_value=95.0, value=30.0, step=1.0)
-    vat = st.number_input('MWST auf Verkauf (%)', min_value=0.0, max_value=30.0, value=8.1, step=0.1)
-    payment_fee = st.number_input('Zahlungsgebühr auf Bruttoverkauf (%)', min_value=0.0, max_value=30.0, value=3.0, step=0.1)
-    extra = st.number_input('Zusätzliche variable Kosten je Box (CHF, netto)', min_value=0.0, value=5.0, step=0.5)
-    st.caption('Beschaffungsversand, Versand an Kunden, Arbeitszeit, Retouren etc. hier berücksichtigen. Alle Artikelpreise werden in diesem MVP vereinfachend als Kosten ohne Vorsteuerkorrektur behandelt.')
+    budget = st.number_input('Max. Materialkosten pro Box (CHF)', min_value=1.0, value=30.0, step=1.0)
+    quantity = st.number_input('Anzahl Boxen', min_value=1, value=10, step=1)
+    margin = st.number_input('Ziel-Deckungsbeitragsmarge (%)', min_value=0.0, max_value=90.0, value=30.0)
+    packing = st.number_input('Verpackung, Füllmaterial, Karte pro Box (CHF)', min_value=0.0, value=4.0, step=0.5)
+    other = st.number_input('Weitere variable Kosten pro Box (CHF)', min_value=0.0, value=3.0, step=0.5)
 
-st.subheader('1 · Echte Artikel erfassen')
-st.caption('Pro Zeile einen konkreten Artikel und dessen Originalbild-URL eintragen. Keine KI-erfundenen Produkte oder Bilder.')
-# Explicit column types prevent Arrow/Streamlit conversion failures on cloud deployments.
-source = st.session_state["items"].copy()
-text_columns = ['Produkt', 'Händler', 'Produktlink', 'Originalbild-URL', 'Verfügbarkeit für Gesamtmenge']
-for column in text_columns:
-    source[column] = source[column].fillna('').astype(str)
-source['Stückpreis CHF'] = pd.to_numeric(source['Stückpreis CHF'], errors='coerce').fillna(0.0).astype(float)
-source['Anzahl je Box'] = pd.to_numeric(source['Anzahl je Box'], errors='coerce').fillna(0).astype(int)
-df = st.data_editor(source, num_rows='dynamic', use_container_width=True, hide_index=True, key='editor', column_config={
-    'Produktlink':st.column_config.LinkColumn('Produktlink'),
-    'Originalbild-URL':st.column_config.LinkColumn('Originalbild-URL'),
-    'Stückpreis CHF':st.column_config.NumberColumn('Stückpreis CHF',min_value=0,format='%.2f'),
-    'Anzahl je Box':st.column_config.NumberColumn('Anzahl je Box',min_value=0,step=1),
-})
-st.session_state.items = df.copy()
-prices = pd.to_numeric(df.get('Stückpreis CHF',pd.Series(dtype=float)),errors='coerce').fillna(0).clip(lower=0)
-counts = pd.to_numeric(df.get('Anzahl je Box',pd.Series(dtype=float)),errors='coerce').fillna(0).clip(lower=0)
-material = float((prices*counts).sum())
-# Gross sale price needed for target contribution margin on net sales, assuming fee as percent of gross sales.
-net_factor = 1/(1+vat/100)
-fee_factor = payment_fee/100
-required_gross = (material+extra) / ((1-margin/100)*net_factor-fee_factor) if (1-margin/100)*net_factor>fee_factor else float('inf')
-left = budget-material
-c1,c2,c3,c4 = st.columns(4)
-c1.metric('Material / Box',f'CHF {material:.2f}')
-c2.metric('Material für Auftrag',f'CHF {material*qty:.2f}')
-c3.metric('Restbudget / Box',f'CHF {left:.2f}')
-c4.metric('Min. Verkaufspreis brutto*',f'CHF {required_gross:.2f}' if required_gross != float('inf') else 'Nicht möglich')
-if left < 0: st.error('Materialbudget überschritten.')
-else: st.success('Materialbudget rechnerisch eingehalten – Verfügbarkeit und Nebenkosten noch prüfen.')
-st.caption('*Vereinfachte Kalkulation: Materialpreise ohne Vorsteuerkorrektur, variable Zusatzkosten netto, Zahlungsgebühr auf Bruttoverkauf, Zielmarge auf Nettoerlös. Kein bestätigter Endverkaufspreis.')
+try:
+    api_key = st.secrets.get('SERPAPI_API_KEY', '') or os.environ.get('SERPAPI_API_KEY', '')
+except Exception:
+    api_key = os.environ.get('SERPAPI_API_KEY', '')
 
-st.subheader('2 · Produktgetreue Bildübersicht')
-st.caption('Die Vorschau zeigt ausschließlich die Originalbilder der eingetragenen URLs. Fehlt ein Bild, wird bewusst kein Ersatzprodukt erfunden.')
-cols = st.columns(3)
-for i, (_, r) in enumerate(df.iterrows()):
-    with cols[i%3]:
-        st.markdown(f"**{str(r.get('Produkt','Artikel'))}**")
-        url = str(r.get('Originalbild-URL','') or '').strip()
-        if url.startswith('https://'):
-            st.image(url, use_container_width=True)
+if not api_key:
+    st.error('SERPAPI_API_KEY fehlt in Streamlit Secrets. Bitte unter App settings → Secrets speichern.')
+    st.stop()
+
+st.subheader('1 · Suchbegriffe')
+st.write('Die Suchbegriffe sind editierbar. Starte zunächst mit 2–4 Produkttypen; jede Zeile verursacht eine Suchanfrage.')
+default_terms = 'A5 Notizbuch schwarz\nTrinkflasche wiederverwendbar\nSchweizer Schokolade 100g\nGeschenkbox Karton schwarz'
+terms_text = st.text_area('Ein Produkttyp pro Zeile', value=default_terms, height=125)
+shops = st.multiselect('Shops für gezielte Suche', ['galaxus.ch', 'coop.ch', 'migros.ch', 'ikea.com', 'brack.ch'], default=['galaxus.ch', 'coop.ch', 'migros.ch'])
+max_queries = st.slider('Maximale Suchanfragen pro Durchlauf', 1, 12, 6)
+
+if 'results' not in st.session_state:
+    st.session_state['results'] = []
+if 'selected' not in st.session_state:
+    st.session_state['selected'] = {}
+
+def price_from_text(s):
+    if s is None:
+        return None
+    if isinstance(s, (int, float)):
+        return float(s)
+    s = str(s)
+    m = re.search(r'(?:CHF\s*)?(\d{1,5}(?:[\'’ ]\d{3})*(?:[.,]\d{1,2})?)', s)
+    if not m:
+        return None
+    raw = m.group(1).replace(' ', '').replace("'", '').replace('’', '')
+    if ',' in raw and '.' in raw:
+        raw = raw.replace('.', '').replace(',', '.')
+    elif ',' in raw:
+        raw = raw.replace(',', '.')
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+def serp_search(term, domain):
+    q = f'{term} kaufen CHF Schweiz site:{domain}' if domain else f'{term} kaufen CHF Schweiz'
+    response = requests.get('https://serpapi.com/search.json', params={
+        'engine': 'google', 'q': q, 'gl': 'ch', 'hl': 'de', 'num': 10, 'api_key': api_key
+    }, timeout=25)
+    response.raise_for_status()
+    data = response.json()
+    if data.get('error'):
+        raise RuntimeError(data['error'])
+    results = []
+    for r in data.get('organic_results', []):
+        link = r.get('link', '')
+        if not link.startswith('https://'):
+            continue
+        rich = r.get('rich_snippet', {})
+        top = rich.get('top', {}) if isinstance(rich, dict) else {}
+        bottom = rich.get('bottom', {}) if isinstance(rich, dict) else {}
+        extracted = r.get('price') or r.get('extracted_price')
+        if extracted is None:
+            for v in (top, bottom):
+                if isinstance(v, dict):
+                    extracted = v.get('detected_extensions', {}).get('price') if isinstance(v.get('detected_extensions'), dict) else None
+                    if extracted is not None:
+                        break
+        price = price_from_text(extracted) if extracted is not None else None
+        thumb = r.get('thumbnail') or ''
+        results.append({'Suchbegriff': term, 'Produkt': r.get('title', '')[:200],
+                        'Händler': urlparse(link).netloc, 'Preis CHF': price,
+                        'Produktlink': link, 'Bild-URL': thumb,
+                        'Status': 'Preis unbestätigt' if price is not None else 'Preis fehlt',
+                        'Abgerufen UTC': datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')})
+    return results
+
+if st.button('🔎 Produkte online suchen', type='primary'):
+    terms = [x.strip() for x in terms_text.splitlines() if x.strip()]
+    queries = [(t, d) for t in terms for d in (shops or [''])][:max_queries]
+    if not queries:
+        st.warning('Bitte mindestens einen Suchbegriff eingeben.')
+    else:
+        found = []
+        with st.spinner(f'Suche läuft: {len(queries)} Abfragen …'):
+            for term, domain in queries:
+                try:
+                    found.extend(serp_search(term, domain))
+                except Exception as exc:
+                    st.warning(f'Suche {term} / {domain or "allgemein"} fehlgeschlagen: {exc}')
+        seen = set()
+        unique = []
+        for item in found:
+            if item['Produktlink'] not in seen:
+                unique.append(item)
+                seen.add(item['Produktlink'])
+        st.session_state['results'] = unique
+        st.success(f'{len(unique)} unterschiedliche Suchtreffer gefunden. Nicht alle enthalten auslesbare Preise.')
+
+st.subheader('2 · Gefundene Angebote prüfen')
+results = st.session_state['results']
+if not results:
+    st.write('Noch keine Suchergebnisse. Starte die Recherche oben.')
+else:
+    st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True,
+                 column_config={'Produktlink': st.column_config.LinkColumn('Produktlink'),
+                                'Bild-URL': st.column_config.LinkColumn('Bild-URL'),
+                                'Preis CHF': st.column_config.NumberColumn('Preis CHF', format='%.2f')})
+    st.caption('Google-Suchtreffer liefern nicht immer Preise oder Produktbilder. Leere Preisfelder werden bewusst nicht erfunden.')
+    st.subheader('3 · Artikel für deine Box auswählen')
+    candidates = [r for r in results if r['Preis CHF'] is not None]
+    if not candidates:
+        st.warning('Keine maschinenlesbaren Preise gefunden. Prüfe die Händlerlinks und trage Preise in einer späteren Version manuell nach.')
+    else:
+        options = list(range(len(candidates)))
+        chosen = st.multiselect('Artikel auswählen (pro ausgewähltem Artikel 1 Stück je Box)', options,
+                                format_func=lambda i: f"{candidates[i]['Produkt'][:75]} · CHF {candidates[i]['Preis CHF']:.2f} · {candidates[i]['Händler']}")
+        chosen_items = [candidates[i] for i in chosen]
+        material = sum(x['Preis CHF'] for x in chosen_items) + packing
+        variable = material + other
+        min_sale = variable / (1 - margin / 100) if margin < 100 else float('inf')
+        c1, c2, c3 = st.columns(3)
+        c1.metric('Material pro Box', f'CHF {material:.2f}', delta=f'{budget-material:+.2f} CHF zum Budget')
+        c2.metric('Material für alle Boxen', f'CHF {material*quantity:.2f}')
+        c3.metric('Rechnerischer Mindestpreis', f'CHF {min_sale:.2f}')
+        if material > budget:
+            st.error('Budget überschritten.')
         else:
-            st.warning('Originalfoto fehlt')
-        link = str(r.get('Produktlink','') or '').strip()
-        if link.startswith('https://'): st.link_button('Zum Händler',link)
-        st.caption(f"CHF {float(pd.to_numeric(r.get('Stückpreis CHF',0),errors='coerce') or 0):.2f} · {r.get('Verfügbarkeit für Gesamtmenge','Ungeprüft')}")
+            st.success('Vorläufig innerhalb des Materialbudgets (ohne nicht erfasste Kosten).')
+        st.caption('Mindestpreis = (Material + weitere variable Kosten) / (1 − Zielmarge). Vereinfachte Rechnung ohne MWST, Plattformgebühren, Beschaffungsversand und Mengenrabatte. Nicht als endgültige Verkaufspreiskalkulation verwenden.')
+        for item in chosen_items:
+            with st.expander(item['Produkt']):
+                st.write(f"Händler: {item['Händler']} · Preisindikator: CHF {item['Preis CHF']:.2f}")
+                st.link_button('Originalangebot öffnen', item['Produktlink'])
+                if item['Bild-URL'] and item['Bild-URL'].startswith('https://'):
+                    st.image(item['Bild-URL'], width=220, caption='Suchmaschinen-Vorschaubild; Identität und Nutzungsrechte prüfen')
+        st.download_button('Einkaufsliste als CSV exportieren', pd.DataFrame(chosen_items).to_csv(index=False).encode('utf-8-sig'), file_name='productcreator_einkaufsliste.csv', mime='text/csv')
 
-st.subheader('3 · Export für Einkauf und Shopify-Vorbereitung')
-out = df.copy()
-out['Gesamtmenge'] = counts.astype(int)*qty
-out['Gesamtkosten CHF'] = (prices*counts*qty).round(2)
-st.download_button('Einkaufsliste als CSV',out.to_csv(index=False).encode('utf-8-sig'),file_name='productcreator_einkaufsliste.csv',mime='text/csv')
-report = {'produktidee':idea,'budget_pro_box_chf':budget,'boxen':qty,'zielmarge_prozent':margin,'material_pro_box_chf':round(material,2),'material_gesamt_chf':round(material*qty,2),'mindestens_verkaufspreis_brutto_chf':round(required_gross,2) if required_gross!=float('inf') else None,'recherche_status':'manuell erfasste Angebote; nicht live verifiziert','erstellt_utc':datetime.now(timezone.utc).isoformat(),'artikel':out.fillna('').to_dict(orient='records')}
-st.download_button('Projekt als JSON',json.dumps(report,ensure_ascii=False,indent=2).encode('utf-8'),file_name='productcreator_projekt.json',mime='application/json')
-st.caption('Nächste Ausbaustufe: Such-API, Händlerquellen, Bildabgleich, optimierte Produktauswahl und Shopify-Entwürfe. Keine Zugangsdaten im Quellcode speichern.')
+st.divider()
+st.caption('MVP 0.4: Recherchiert über SerpAPI/Google, aber noch keine autonome KI-Komposition, keine verifizierte Produktbild-Montage, keine Shopify-Veröffentlichung. Preise und Bestellbarkeit vor Kauf direkt beim Händler prüfen.')
